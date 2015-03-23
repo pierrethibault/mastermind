@@ -9,6 +9,7 @@ import numpy as np
 import time
 import sets
 
+
 def log0(x):
     return np.log2(x) if x != 0 else 1
 
@@ -40,8 +41,8 @@ class MMplayer(object):
         """
         move = np.asarray(move)
         m = 0
-        for i,j in zip(self.solution, move):
-            m += (i==j)
+        for i, j in zip(self.solution, move):
+            m += (i == j)
 
         S = 0
         for c in range(self.Nc):
@@ -49,8 +50,12 @@ class MMplayer(object):
             sm = sum(move == c)
             S += abs(ss - sm)
         c = self.Np - S/2 - m
+        
+        self._announce('Result: %d good, %d wrong place' % (m,c))
+        return m, c
 
-        return (m,c)
+    def _announce(self, message):
+        print ('Player >>>>> %40s' % message)
 
 
 class MMsolver(object):
@@ -91,41 +96,44 @@ class MMsolver(object):
         """
         Compute statistics and return a move.
         """
-
+        
+        # Special case for the first move.
         if not self.moves:
-            move = range(self.Np)
+            move = np.arange(self.Np)
             self.moves.append(move)
-            return move
-
+            entropy = np.nan
+            self._announce('Move : %s (entropy: %f bits)' % (str(move), entropy))
+            return move, entropy
+        
         # Randomly pick templates from all available states
         solidx = np.random.permutation(self.N)
 
-        # Stopping criterion
-        if (self.max_templates is not None) and (self.max_templates < N):
-            solidx = solidx[:self.max_templates]
-
         best_entropy = 0.
         t0 = time.time()
-        for i in solidx:
+        can_exit = False
+        for k, i in enumerate(solidx):
             template = self.allstates[i]
             entropy = self._entropy(template)
             if entropy > best_entropy:
                 # Better candidate
                 best_template = template
                 best_entropy = entropy 
-                print '%s (%f)' % (str(template), entropy)
-
-            if self.max_time is not None:
-                if time.time() - t0 > self.max_time:
-                    print 'time out'
+                can_exit = True
+            if can_exit:
+                if (self.max_templates is not None) and (k>= self.max_templates):
+                    self._announce('Max number of templates (%d) reached' % self.max_templates)
+                    break
+                if (self.max_time is not None) and (time.time() - t0 > self.max_time):
+                    self._announce('Time out after %d templates' % k)
                     break
 
         self.moves.append(best_template)
-        return best_template
-
+        self._announce('Move : %s (entropy: %f bits)' % (str(best_template), best_entropy))
+        return best_template, best_entropy
+    
     def new_result(self, mc, move=None):
         """
-        Receive result, eliminate possible solutions.
+        Receive result, reevaluate possible solutions.
         """
 
         if move is None:
@@ -134,6 +142,8 @@ class MMsolver(object):
         (allm, allc) = self._mc(self.solutions, move)
         pmc = allm*self.Np + allc
         self.solutions = self.solutions[pmc == mc[0]*self.Np + mc[1]]
+        self._announce('%d remaining possible solutions' % len(self.solutions))
+
 
     @property
     def solved(self):
@@ -144,12 +154,15 @@ class MMsolver(object):
         template = np.asarray(template)
         m = (states == template).sum(axis=-1)
 
-        cstates = np.array([(states == c).sum(axis=-1) for c in range(self.Nc) ]).T
-        ctemplate = np.array([ (template == c).sum() for c in range(self.Nc) ])
+        cstates = np.array([(states == c).sum(axis=-1) for c in range(self.Nc)]).T
+        ctemplate = np.array([(template == c).sum() for c in range(self.Nc)])
         S = abs(cstates - ctemplate).sum(axis=-1)
         c = self.Np - S/2 - m
 
-        return (m,c)
+        return m, c
+
+    def _announce(self, message):
+        print ('Solver >>>>> %40s' % message)
 
     def _entropy(self, template, ensemble=None):
         """
@@ -161,38 +174,47 @@ class MMsolver(object):
             ensemble = self.solutions
 
         N = len(ensemble)
-
-        # Initialize the outcome dict
-        possible_outcomes = [(mi,ci) for mi in range(self.Np+1) for ci in range(self.Np-mi+1)]
-        outcomes = dict((p,0) for p in possible_outcomes)
-
-        (allm, allc) = self._mc(ensemble, template)
-        for (m,c) in zip(allm, allc):
-           outcomes[(m,c)] += 1
-
+                
+        allm, allc = self._mc(ensemble, template)
+        pmc = allm*self.Np + allc
+        outcomes = np.bincount(allm*self.Np + allc)
+        
         # Compute entropy
-        entropy = sum(ni * log0(ni) for ni in outcomes.values()) / N - log0(N)
+        entropy = sum(ni * log0(ni) for ni in outcomes) / N - log0(N)
 
         return -entropy
 
 
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) == 1:
+        Ntries = 1
+    else:
+        Ntries = int(sys.argv[1])
     #Np = int(sys.argv[1])
     #clist = [x for x in sys.argv[2]]
-    Np = 4
-    clist = 'abcdef'
+    Np = 6
+    clist = 'abcdefghij'
     mmplayer = MMplayer(Np, clist)
-    mmsolver = MMsolver(Np, clist)
-
-    print 'Solution is %s' % str(mmplayer.solution)
-
-    t0 = time.time()
-    while not mmsolver.solved:
-        move = mmsolver.choose_move()
-        result = mmplayer.new_move(move)
-        mmsolver.new_result(result)
-        print result, len(mmsolver.solutions)
-    print 'Solution is %s' % str(mmsolver.solutions[0])
-    print 'Solved in %d turns and %f seconds' % (len(mmsolver.moves), time.time() - t0)
+    mmsolver = MMsolver(Np, clist, max_time=30)
+    
+    tlist = []
+    nlist = []
+    for i in range(Ntries):
+        print 'New problem'
+        mmplayer.initialize()
+        mmsolver.initialize()
+        
+        t0 = time.time()
+        while not mmsolver.solved:
+            move, entropy = mmsolver.choose_move()
+            result = mmplayer.new_move(move)
+            mmsolver.new_result(result)
+        tlist.append(time.time() - t0)
+        nlist.append(len(mmsolver.moves))
+        print 'Solution is %s (check: %s)' % (str(mmsolver.solutions[0]), str(mmplayer.solution))
+        print 'Solved in %d turns and %f seconds' % (nlist[-1], tlist[-1])
+        
+    print 'Avg time: %f' % np.mean(tlist)
+    print 'Avg number of moves: %f' % np.mean(nlist)
 
