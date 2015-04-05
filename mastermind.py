@@ -7,11 +7,66 @@ date: March 2015
 
 import numpy as np
 import time
-import sets
+import multiprocessing as mp
+
+class Dummy(object):
+    pass
+myglobals = Dummy()  # Container for shared arrays
 
 
+# Useful function
 def log0(x):
     return np.log2(x) if x != 0 else 1
+
+
+class EntropyWorker(mp.Process):
+    def __init__(self, rank, size, queue, max_templates, max_time):
+        """
+        Process worker that computes entropies
+        """
+        super(EntropyWorker, self).__init__()
+        self.rank = rank
+        self.size = size
+        self.q = queue
+        self.max_templates = max_templates
+        self.max_time = max_time
+
+    def run(self):
+        """
+        Compute as many entropies as possible in the given time.
+        """
+        N = myglobals.N
+        t0 = time.time()
+        # Loop through states that belong to this process
+        for k, i in enumerate(myglobals.solidx[self.rank::self.size]):
+            # Get template
+            template = myglobals.allstates[i]
+
+            # Compute matches
+            m = (myglobals.solutions == template).sum(axis=-1)
+
+            # Compute color matches
+            ctemplate = np.array([(template == c).sum() for c in range(myglobals.Nc)])
+            S = abs(myglobals.csol - ctemplate).sum(axis=-1)
+            c = myglobals.Np - S/2 - m
+
+            # Combine them for binning
+            outcomes = np.bincount(m*myglobals.Np + c)
+
+            # Compute entropy
+            entropy = sum(ni * log0(ni) for ni in outcomes) / N - log0(N)
+
+            # Put the result in the queue
+            self.q.put((-entropy, i))
+
+            # Exit if some conditions are met.
+            if (self.max_templates is not None) and (k>= self.max_templates):
+                MMsolver._announce('Max number of templates (%d) reached' % self.max_templates)
+                break
+            if ((self.max_time is not None) and (time.time() - t0 > self.max_time)):
+                MMsolver._announce('Time out after %d templates' % k)
+                break
+        return
 
 
 class MMplayer(object):
@@ -20,7 +75,7 @@ class MMplayer(object):
         """
         Mastermind player.
         Np: number of pegs
-        Nc: number of colors
+        Nc: number of colours
         """
         self.Nc = Nc
         self.Np = Np
@@ -53,15 +108,16 @@ class MMplayer(object):
         self._announce('Result: %d good, %d wrong place' % (m,c))
         return m, c
 
-    def _announce(self, message):
+    @staticmethod
+    def _announce(message):
         print ('Player >>>>> %40s' % message)
 
 
 class MMsolver(object):
 
-    def __init__(self, Np, Nc, max_templates=None, max_time=60):
+    def __init__(self, Np, Nc, mp=True, max_templates=None, max_time=60):
         """
-        Initialize with Np pegs and Nc colors.
+        Initialize with Np pegs and Nc colours.
         """
         self.Nc = Nc
         self.Np = Np
@@ -69,6 +125,8 @@ class MMsolver(object):
 
         self.max_templates = max_templates
         self.max_time = max_time
+
+        self.mp = mp
 
         self.initialize()
 
@@ -87,14 +145,15 @@ class MMsolver(object):
         self.solutions = allstates.copy()
         self.allstates = allstates
 
-        self.possible_results = [(i, j) for i in range(self.Np+1) for j in range(self.Np+1-i)]
-        self.mc2key = dict((x, x[0]*u'M'+x[1]*u'C') for x in self.possible_results)
-        self.key2mc = dict((v, k) for k, v in self.mc2key.iteritems())
-
         # List of moves
         self.moves = []
 
-    def choose_move(self):
+        if self.mp:
+            self.choose_move = self.choose_move_mp
+        else:
+            self.choose_move = self.choose_move_nomp
+
+    def choose_move_nomp(self):
         """
         Compute statistics and return a move.
         """
@@ -102,12 +161,20 @@ class MMsolver(object):
         # Update the color info
         self.csol = np.array([(self.solutions == c).sum(axis=-1) for c in range(self.Nc)]).T
 
-        # First move is different
-        if len(self.moves) == 0:
+        # Special case for the first move.
+        if not self.moves:
             move = np.arange(self.Np)
             entropy = np.nan
             self.moves.append(move)
             self._announce('Move : %s (entropy: %f bits)' % (str(move), entropy))
+            return move, entropy
+
+        # Special case for the solution
+        if len(self.solutions) == 1:
+            move = self.solutions[0]
+            self.moves.append(move)
+            entropy = 0. # self._entropy(move)
+            self._announce('Solution : %s (entropy: %f bits)' % (str(move), entropy))
             return move, entropy
 
         # Randomly pick templates from all available states
@@ -118,7 +185,7 @@ class MMsolver(object):
         can_exit = False
         for k, i in enumerate(solidx):
             template = self.allstates[i]
-            entropy = self._entropy(template)
+            entropy = self.entropy(template)
             if entropy > best_entropy:
                 # Better candidate
                 best_template = template
@@ -136,24 +203,100 @@ class MMsolver(object):
         self._announce('Move : %s (entropy: %f bits)' % (str(best_template), best_entropy))
         return best_template, best_entropy
 
+    def choose_move_mp(self):
+        """
+        Compute statistics and return a move.
+        Use multiprocessing.
+        """
+
+        # Update the color info
+        self.csol = np.array([(self.solutions == c).sum(axis=-1) for c in range(self.Nc)]).T
+
+        # Special case for the first move.
+        if not self.moves:
+            move = np.arange(self.Np)
+            self.moves.append(move)
+            entropy = np.nan  # self._entropy(move)
+            self._announce('Move : %s (entropy: %f bits)' % (str(move), entropy))
+            return move, entropy
+
+        # Special case for the solution
+        if len(self.solutions) == 1:
+            move = self.solutions[0]
+            self.moves.append(move)
+            entropy = 0. # self._entropy(move)
+            self._announce('Solution : %s (entropy: %f bits)' % (str(move), entropy))
+            return move, entropy
+
+
+        # Randomly pick templates from all available states
+        solidx = np.random.permutation(self.N)
+
+        # Put all useful arrays in the globals dict before forking
+        myglobals.allstates = self.allstates
+        myglobals.solutions = self.solutions
+        myglobals.csol = self.csol
+        myglobals.solidx = solidx
+        myglobals.N = len(self.solutions)
+        myglobals.Nc = self.Nc
+        myglobals.Np = self.Np
+
+        # create queues
+        q = mp.Queue()
+
+        # create processes
+        numworkers = 4
+        timeout = 120 if self.max_time is None else self.max_time
+        processes = [EntropyWorker(rank=i, size=numworkers, queue=q, max_templates=self.max_templates, max_time=self.max_time) for i in range(numworkers)]
+
+        # Run the processes and join
+        for p in processes:
+            p.start()
+
+        best_entropy = 0.
+        # Get the results from the queue.
+        go = True
+        while go:
+            if not q.empty():
+                r = q.get()
+                if r[0] > best_entropy:
+                    # Better candidate
+                    best_template = self.allstates[r[1]]
+                    best_entropy = r[0]
+            else:
+                go = False
+                for p in processes:
+                    go |= p.is_alive()
+
+        for p in processes:
+            p.join()
+
+        self.moves.append(best_template)
+        self._announce('Move : %s (entropy: %f bits)' % (str(best_template), best_entropy))
+        return best_template, best_entropy
+
     def new_result(self, mc, move=None):
         """
         Receive result, reevaluate possible solutions.
         """
         if move is None:
             move = self.moves[-1]
+        else:
+            self.moves[-1] = move
+            self.csol = np.array([(self.solutions == c).sum(axis=-1) for c in range(self.Nc) ]).T
+            self._announce('Entropy : %f' % self.entropy(move))
 
-        m, c = mc
-        all_m, all_c = self._mc(move)
-        pmc = all_m*self.Np + all_c
-        self.solutions = self.solutions[pmc == (m*self.Np + c)].copy()
+        (allm, allc) = self._mc(move)
+        pmc = allm*self.Np + allc
+        self.solutions = self.solutions[pmc == mc[0]*self.Np + mc[1]]
         self._announce('%d remaining possible solutions' % len(self.solutions))
 
     @property
     def solved(self):
         return len(self.solutions) == 1
 
-    def _announce(self, message):
+    @staticmethod
+    def _announce(message):
         print 'Solver >>>>> ' + ('%40s' % message)
 
     def _mc(self, template):
@@ -161,25 +304,25 @@ class MMsolver(object):
         template = np.asarray(template)
         m = (self.solutions == template).sum(axis=-1)
         ctemplate = np.array([(template == c).sum() for c in range(self.Nc)])
-        s = abs(self.csol - ctemplate).sum(axis=-1)
-        c = self.Np - s/2 - m
+        S = abs(self.csol - ctemplate).sum(axis=-1)
+        c = self.Np - S/2 - m
 
         return m, c
 
-    def _entropy(self, template):
+    def entropy(self, template):
         """
-        Compute the entropy of the solutions conditional to the template.
+        Compute the entropy of the possible solutions conditional to the template.
         """
 
         N = len(self.solutions)
 
-        m, c = self._mc(template)
-        outcomes = np.bincount(m*self.Np + c)
+        (allm, allc) = self._mc(template)
+        outcomes = np.bincount(allm*self.Np + allc)
 
         # Compute entropy
-        h = sum(ni * log0(ni) for ni in outcomes) / N - log0(N)
+        entropy = sum(ni * log0(ni) for ni in outcomes) / N - log0(N)
 
-        return -h
+        return -entropy
 
 
 if __name__ == "__main__":
@@ -190,7 +333,7 @@ if __name__ == "__main__":
         Ntries = int(sys.argv[1])
     Np, Nc = 4, 6
     mmplayer = MMplayer(Np, Nc)
-    mmsolver = MMsolver(Np, Nc, max_time=.5)
+    mmsolver = MMsolver(Np, Nc, max_time=1)
 
     tlist = []
     nlist = []
